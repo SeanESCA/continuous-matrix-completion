@@ -12,26 +12,26 @@ def syntheticA(n: int) -> torch.tensor:
 
     return X @ X.T
 
-def initial(mu: int, n: int, r: float) -> list:
+def initial(A: torch.tensor, r: float) -> list:
     """
     Randomly initialises the matrix factors X and Y.
     """
-    X0 = torch.rand(mu, r)*1e-3
-    Y0 = torch.rand(n, r)*1e-3
+    X0 = torch.rand(A.size(0), r)*1e-3
+    Y0 = torch.rand(A.size(1), r)*1e-3
     X0.requires_grad_()
     Y0.requires_grad_()
 
     return [X0, Y0]
 
-def bernoulli(n1: int, n2: int, p: float) -> torch.tensor:
+def bernoulli(A: torch.tensor, p: float) -> torch.tensor:
     """
     Produces a set of index pairs I = {(i1,i2)} where
     i1 = 0,...,(n1)-1, i2 = 0,...,(n2)-1, and each pair 
     is sampled with probability p.
     """
     I = []
-    for i1 in range(n1):
-        for i2 in range(n2):
+    for i1 in range(A.size(0)):
+        for i2 in range(A.size(1)):
             if np.random.rand() < p:
                 I.append([i1,i2])
     np.random.shuffle(I)
@@ -55,83 +55,85 @@ def completion_err(X: torch.tensor, Y: torch.tensor, A: torch.tensor) -> float:
     return torch.norm(X@Y.T - A)/A.norm()
 
 # Loss Functions
+
 mse_loss = torch.nn.MSELoss()
 asd_loss = lambda X, Y: 0.5*((X - Y)**2).sum()
 
 def batch_loss( X: torch.tensor, 
                 Y: torch.tensor, 
                 A: torch.tensor, 
-                X_ind: torch.tensor, 
-                Y_ind: torch.tensor, 
-                A_ind: torch.tensor,
+                I: torch.tensor,
                 loss: function = mse_loss):
     '''
-    Evaluates the loss function over a mini-batch.
+    Evaluates the loss function over index set I.
     '''
     return loss(torch.einsum(
         'in, in -> i',
-        torch.index_select(X, 0, X_ind), 
-        torch.index_select(Y, 0, Y_ind)
-    ), A.take(A_ind))
+        torch.index_select(X, 0, I[:,0]), 
+        torch.index_select(Y, 0, I[:,1])
+    ), A[I[:,0], I[:,1]])
 
 # Algorithms for standard matrix completion.
 
-def optimise(optimiser, params, Y, I, B=1, dk=100, q=0.99, K=10000):
+def optimise(optimiser, X, Y, A, I, B=1, dk=100, K=10000, k_test=1, k_true=int(1e7), q=0.99):
     
-    U_ind, W_ind = I.T
-    Y_ind = U_ind*Y.shape[1] + W_ind
-    batch_size = int((len(Y_ind)*0.9)//B)
-    test_set_start = batch_size*B
+    # Compute the training mini-batch size.
+    batch_size = int((I.size(0) * 0.9) // B)
+
+    # Compute the starting index of the test set.
+    test_set_start = batch_size * B
 
     train_loss_list = []
     test_loss_list = []
     true_err_list = []
     timestamps = []
-    best_U = None
-    best_W = None
+    best_params = []
     best_test_loss = 1e6
-    best_iter = 0
 
     for k in range(K):
-        timestamps.append(time())
-        i = (k % B)*batch_size
-        j = (k % B + 1)*batch_size
-        train_loss = batch_loss(params[0], params[1], Y, 
-                                   U_ind[i:j], W_ind[i:j], Y_ind[i:j])
-        
-        test_loss = batch_loss(params[0], params[1], Y, 
-                               U_ind[test_set_start:], W_ind[test_set_start:], Y_ind[test_set_start:])
-        # true_err = completion_err(params[0], params[1], Y)
-
+        train_loss = batch_loss(X, Y, A, I[((k % B) * batch_size):((k % B + 1) * batch_size)])
         train_loss_list.append(train_loss.item())
-        test_loss_list.append(test_loss.item())
-        # true_err_list.append(true_err.item())
-        
-        # Save best parameters.
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_U = params[0].detach().clone()
-            best_W = params[1].detach().clone()
-            best_iter = k
+        timestamps.append(time())
 
-        # Early stopping.
-        if (k >= dk) and (test_loss > q * test_loss_list[k - dk]):
-            break
+        # Compute the test loss.
+        if (k % k_test == 0):
+            test_loss = batch_loss(X, Y, A, I[test_set_start:])
+            test_loss_list.append(test_loss.item())
+            
+            # Save best parameters.
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss.item()
+                best_params = [X.detach().clone(), Y.detach().clone()]
+
+            # Early stopping condition.
+            if (k >= dk) and (test_loss > (q * test_loss_list[(k - dk)//k_test])):
+                break
+
+        # Compute the mean completion error.
+        if (k % k_true):
+            true_err = completion_err(X, Y, A)
+            true_err_list.append(true_err.item())
         
         train_loss.backward()
         optimiser.step()
         optimiser.zero_grad()
 
-    print(f"{k}, {best_iter}, {completion_err(best_U, best_W, Y)}")
+    print(f"Best mean completion error: {completion_err(best_params[0], best_params[1], A)}")
 
     return {
-        "final_params": params,
         "train_loss_list": train_loss_list,
         "test_loss_list": test_loss_list,
         "true_err_list": true_err_list,
         "timestamps": timestamps,
-        "best_params": [best_U, best_W],
-        "best_iter": best_iter
+        "best_params": best_params,
+        "final_params": [X, Y],
+        "k_test": k_test,
+        "k_true": k_true,
+        "B": B,
+        "dk": dk,
+        "K": K,
+        "q": q,
+        "lr": optimiser.param_groups[0]["lr"]
     }
 
 def asd_1(U, W, Y, I, B=1, dk=100, q=0.99, K=1000, lr=4):
