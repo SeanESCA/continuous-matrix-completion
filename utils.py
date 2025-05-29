@@ -6,7 +6,13 @@ from time import time
 
 def syntheticA(n: int) -> torch.tensor:
     """
-    Produces a synthetic rank-2 n-by-n matrix
+    Produces a synthetic rank-2 square matrix.
+
+    Inputs:
+    - n (int): Size of the matrix.
+
+    Outputs:
+    - A torch tensor of shape (n, n).
     """
     X = torch.vstack((torch.arange(n)/n, (1 - torch.arange(n)/n)**2)).T
 
@@ -14,7 +20,15 @@ def syntheticA(n: int) -> torch.tensor:
 
 def initial(A: torch.tensor, r: float) -> list:
     """
-    Randomly initialises the matrix factors X and Y.
+    Randomly initialises the matrix factors X and Y of the solution X(Y.T).
+
+    Inputs:
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - r (int): Rank of the solution .
+
+    Outputs:
+    - X0 (torch.tensor): Matrix of shape (n1, r).
+    - Y0 (torch.tensor): Matrix of shape (n2, r).
     """
     X0 = torch.rand(A.size(0), r)*1e-3
     Y0 = torch.rand(A.size(1), r)*1e-3
@@ -25,9 +39,15 @@ def initial(A: torch.tensor, r: float) -> list:
 
 def bernoulli(A: torch.tensor, p: float) -> torch.tensor:
     """
-    Produces a set of index pairs I = {(i1,i2)} where
-    i1 = 0,...,(n1)-1, i2 = 0,...,(n2)-1, and each pair 
-    is sampled with probability p.
+    Produces a set of index pairs I = {(i1,i2)} where i1 = 0,...,(n1)-1, 
+    i2 = 0,...,(n2)-1, and each pair is sampled with probability p.
+
+    Inputs:
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - p (float): Sampling probability.
+
+    Outputs:
+    - I (torch.tensor): Index matrix. Each row contains an index pair.
     """
     I = []
     for i1 in range(A.size(0)):
@@ -38,19 +58,35 @@ def bernoulli(A: torch.tensor, p: float) -> torch.tensor:
 
     return torch.tensor(I)
 
-def make_mask(n1: int, n2: int, I: torch.tensor) -> torch.tensor:
+def make_mask(A: torch.tensor, I: torch.tensor) -> torch.tensor:
     '''
     Produces a mask based on the index set I.
+
+    Inputs:
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - I (torch.tensor): Index matrix.
+
+    Outputs:
+    - A torch tensor of shape (n1, n2).
     '''
+    n1, n2 = A.shape
     mask = torch.zeros((n1,n2), dtype=torch.int8)
     for i in I:
         mask[i[0], i[1]] = 1
     return mask
 
-def completion_err(X: torch.tensor, Y: torch.tensor, A: torch.tensor) -> float:
+def completion_err(X: torch.tensor, Y: torch.tensor, A: torch.tensor) -> torch.tensor:
     '''
     Computes the mean completion error between the full matrix A
     and the solution X(Y.T).
+
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - A (torch.tensor): Matrix of shape (n1, n2).
+
+    Outputs:
+    - A torch tensor that contains a single element.
     '''
     return torch.norm(X@Y.T - A)/A.norm()
 
@@ -63,9 +99,19 @@ def batch_loss( X: torch.tensor,
                 Y: torch.tensor, 
                 A: torch.tensor, 
                 I: torch.tensor,
-                loss: function = mse_loss):
+                loss: function = mse_loss) -> torch.tensor:
     '''
     Evaluates the loss function over index set I.
+    
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - I (torch.tensor): Index matrix.
+    - loss (function): Loss function.
+
+    Outputs:
+    - A torch.tensor that contains a float. 
     '''
     return loss(torch.einsum(
         'in, in -> i',
@@ -75,13 +121,51 @@ def batch_loss( X: torch.tensor,
 
 # Algorithms for standard matrix completion.
 
-def optimise(optimiser, X, Y, A, I, B=1, dk=100, K=10000, k_test=1, k_true=int(1e7), q=0.99):
+def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
+             algo: str = "sgd", lr: float = 1, B: int = 1, dk: int = 100, K=10000, 
+             k_test=1, k_true=int(1e7), loss: function = mse_loss, q=0.99) -> dict:
+    '''
+    Optimise X and Y such that A = X(Y.T) using SGD or Adam.
     
-    # Compute the training mini-batch size.
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - I (torch.tensor): Index matrix.
+    - algo (str): if not "adam", then SGD will be used.
+    - lr (float): Learning rate.
+    - B (int): Number of mini-batches.
+    - dk (int): Iteration gap for comparing the test loss.
+    - K (int): Maximum number of iterations.
+    - k_test (int): Iteration gap for computing the test loss.
+    - k_true (int): Iteration gap for computing the mean completion error.
+    - q (float): Relative change in the test loss.
+
+    Outputs:
+    - train_loss_list (list): Training loss (float) for every iteration.
+    - test_loss_list (list): Test loss (float) for every (k_test)-th iteration.
+    - true_err_list (list): Mean completion error (float) for every (k_true)-th iteration.
+    - timestamps (list): Time after computing the training loss for every iteration.
+    - best_params (list): Factors [X, Y] with the lowest test loss.
+    - B (int): Number of mini-batches.
+    - dk (int): Iteration gap for comparing the test loss.
+    - K (int): Maximum number of iterations.
+    - k_test (int): Iteration gap for computing the test loss.
+    - k_true (int): Iteration gap for computing the mean completion error.
+    - q (float): Relative change in the test loss.
+    - lr (float): Learning rate.
+    '''
+    # Initialise the optimiser. 
+    if (algo == "adam"):
+        optimiser = torch.optim.Adam([X, Y], lr=lr)
+    else:
+        optimiser = torch.optim.SGD([X, Y], lr=lr)
+
+    # Compute the size of each training mini-batch.
     batch_size = int((I.size(0) * 0.9) // B)
 
     # Compute the starting index of the test set.
-    test_set_start = batch_size * B
+    test_set_start: int = batch_size * B
 
     train_loss_list = []
     test_loss_list = []
@@ -91,7 +175,8 @@ def optimise(optimiser, X, Y, A, I, B=1, dk=100, K=10000, k_test=1, k_true=int(1
     best_test_loss = 1e6
 
     for k in range(K):
-        train_loss = batch_loss(X, Y, A, I[((k % B) * batch_size):((k % B + 1) * batch_size)])
+        # Compute the training loss
+        train_loss = batch_loss(X, Y, A, I[((k % B) * batch_size):((k % B + 1) * batch_size)], loss)
         train_loss_list.append(train_loss.item())
         timestamps.append(time())
 
@@ -100,7 +185,7 @@ def optimise(optimiser, X, Y, A, I, B=1, dk=100, K=10000, k_test=1, k_true=int(1
             test_loss = batch_loss(X, Y, A, I[test_set_start:])
             test_loss_list.append(test_loss.item())
             
-            # Save best parameters.
+            # Update the best parameters.
             if test_loss < best_test_loss:
                 best_test_loss = test_loss.item()
                 best_params = [X.detach().clone(), Y.detach().clone()]
@@ -110,7 +195,7 @@ def optimise(optimiser, X, Y, A, I, B=1, dk=100, K=10000, k_test=1, k_true=int(1
                 break
 
         # Compute the mean completion error.
-        if (k % k_true):
+        if (k % k_true == 0):
             true_err = completion_err(X, Y, A)
             true_err_list.append(true_err.item())
         
@@ -136,92 +221,140 @@ def optimise(optimiser, X, Y, A, I, B=1, dk=100, K=10000, k_test=1, k_true=int(1
         "lr": optimiser.param_groups[0]["lr"]
     }
 
-def asd_1(U, W, Y, I, B=1, dk=100, q=0.99, K=1000, lr=4):
+def asd1(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
+         B: int = 1, dk: int = 100, K=10000, 
+         k_test=1, k_true=int(1e7), q=0.99) -> dict:
+    '''
+    Optimise X and Y such that A = X(Y.T) using mini-batch ASD 1.
+    
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - I (torch.tensor): Index matrix.
+    - B (int): Number of mini-batches.
+    - dk (int): Iteration gap for comparing the test loss.
+    - K (int): Maximum number of iterations.
+    - k_test (int): Iteration gap for computing the test loss.
+    - k_true (int): Iteration gap for computing the mean completion error.
+    - q (float): Relative change in the test loss.
 
-    U_ind, W_ind = I.T
-    Y_ind = U_ind*Y.shape[1] + W_ind
-    batch_size = int((len(Y_ind)*0.9)//B)
-    test_set_start = batch_size*B
+    Outputs:
+    - train_loss_list (list): Training loss (float) for every iteration.
+    - test_loss_list (list): Test loss (float) for every (k_test)-th iteration.
+    - true_err_list (list): Mean completion error (float) for every (k_true)-th iteration.
+    - timestamps (list): Time after computing the training loss for every iteration.
+    - best_params (list): Factors [X, Y] with the lowest test loss.
+    - B (int): Number of mini-batches.
+    - dk (int): Iteration gap for comparing the test loss.
+    - K (int): Maximum number of iterations.
+    - k_test (int): Iteration gap for computing the test loss.
+    - k_true (int): Iteration gap for computing the mean completion error.
+    - q (float): Relative change in the test loss.
+    - lr (float): Learning rate.
+    - lrX_list (list): Learning rates for optimising X in each iteration.
+    - lrY_list (list): Learning rates for optimising Y in each iteration.
+    '''
+    # Initialise the optimisers. 
+    optimiserX = torch.optim.SGD([X])
+    optimiserY = torch.optim.SGD([Y])
+
+    # Compute the size of each training mini-batch.
+    batch_size = int((I.size(0) * 0.9) // B)
+
+    # Compute the starting index of the test set.
+    test_set_start: int = batch_size * B
 
     train_loss_list = []
     test_loss_list = []
     true_err_list = []
     timestamps = []
-    lr_list = []
-    best_U = None
-    best_W = None
+    best_params = []
+    lrX_list = []
+    lrY_list = []
     best_test_loss = 1e6
-    best_iter = 0
-
-    optimiserU = torch.optim.SGD([U], lr=lr)
-    optimiserW = torch.optim.SGD([W], lr=lr)
 
     for k in range(K):
-        timestamps.append(time())
-        i = (k % B)*batch_size
-        j = (k % B + 1)*batch_size
-        
-        # Optimise U for fixed W.
-        train_loss = batch_loss(
-            U, W, Y, U_ind[i:j], W_ind[i:j], Y_ind[i:j], asd_loss
-        )
-        test_loss = batch_loss(U, W, Y, 
-                               U_ind[test_set_start:], W_ind[test_set_start:], Y_ind[test_set_start:])
-        # true_err = completion_err(U, W, Y)
+        # Compute the indexes for the start and end of the mini-batch
+        i: int = (k % B) * batch_size
+        j: int = (k % B + 1) * batch_size
 
+        # Compute the training loss
+        train_loss = batch_loss(X, Y, A, I[i:j], asd_loss)
         train_loss_list.append(train_loss.item())
-        test_loss_list.append(test_loss.item())
-        # true_err_list.append(true_err.item())
+        timestamps.append(time())
 
-        # Save best parameters.
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_U = U.detach().clone()
-            best_W = W.detach().clone()
-            best_iter = k
+        # Compute the test loss.
+        if (k % k_test == 0):
+            test_loss = batch_loss(X, Y, A, I[test_set_start:])
+            test_loss_list.append(test_loss.item())
+            
+            # Update the best parameters.
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss.item()
+                best_params = [X.detach().clone(), Y.detach().clone()]
 
-        # Early stopping.
-        if (k >= dk) and (test_loss > q * test_loss_list[k - dk]):
-            break
+            # Early stopping condition.
+            if (k >= dk) and (test_loss > (q * test_loss_list[(k - dk)//k_test])):
+                break
+
+        # Compute the mean completion error.
+        if (k % k_true == 0):
+            true_err = completion_err(X, Y, A)
+            true_err_list.append(true_err.item())
         
         train_loss.backward()
-        lrU = (U.grad.detach().norm()/torch.einsum(
+
+        # Adaptive learning rate for X.
+        lrX = ((X.grad.norm()/torch.einsum(
             'in, in -> i',
-            torch.index_select(U.grad.detach(), 0, U_ind[i:j]), 
-            torch.index_select(W.detach(), 0, W_ind[i:j])
-        ).norm())**2
-        optimiserU.param_groups[0]["lr"] = lrU 
-        optimiserU.step()
-        optimiserU.zero_grad()
-        optimiserW.zero_grad()
+            torch.index_select(X.grad, 0, I[i:j, 0]), 
+            torch.index_select(Y, 0, I[i:j, 1])
+        ).norm())**2).item()
+        optimiserX.param_groups[0]["lr"] = lrX
 
-        # Optimise W for fixed U.
-        train_loss = batch_loss(
-            U, W, Y, U_ind[i:j], W_ind[i:j], Y_ind[i:j], asd_loss
-        )
+        # Optimise X.
+        optimiserX.step()
+        optimiserX.zero_grad()
+        optimiserY.zero_grad()
 
+        # Compute the training loss.
+        train_loss = batch_loss(X, Y, A, I[i:j], asd_loss)
         train_loss.backward()
-        lrW = (W.grad.detach().norm()/torch.einsum(
+
+        # Adaptive learning rate for Y.
+        lrY = ((Y.grad.norm()/torch.einsum(
             'in, in -> i',
-            torch.index_select(U.detach(), 0, U_ind[i:j]), 
-            torch.index_select(W.grad.detach(), 0, W_ind[i:j])
-        ).norm())**2
-        optimiserW.param_groups[0]["lr"] = lrW
-        optimiserW.step()
-        optimiserW.zero_grad()
-        optimiserU.zero_grad()
-        lr_list.append((lrU, lrW))
-    print(f"{k}, {best_iter}, {completion_err(best_U, best_W, Y)}")
+            torch.index_select(X, 0, I[i:j, 0]), 
+            torch.index_select(Y.grad, 0, I[i:j, 1])
+        ).norm())**2).item()
+        optimiserY.param_groups[0]["lr"] = lrY
+
+        # Optimise Y.
+        optimiserY.step()
+        optimiserX.zero_grad()
+        optimiserY.zero_grad()
+
+        lrX_list.append(lrX)
+        lrY_list.append(lrY)
+
+    print(f"Best mean completion error: {completion_err(best_params[0], best_params[1], A)}")
 
     return {
-        "params": [U, W],
         "train_loss_list": train_loss_list,
         "test_loss_list": test_loss_list,
         "true_err_list": true_err_list,
         "timestamps": timestamps,
-        "best_params": [best_U, best_W],
-        "best_iter": best_iter,
-        "lr_list": lr_list
+        "best_params": best_params,
+        "final_params": [X, Y],
+        "k_test": k_test,
+        "k_true": k_true,
+        "B": B,
+        "dk": dk,
+        "K": K,
+        "q": q,
+        "lrX_list": lrX_list,
+        "lrY_list": lrY_list
     }
 
 def asd_2(U, W, Y, I, B=1, dk=100, q=0.99, K=1000, lr=4):
