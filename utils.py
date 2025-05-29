@@ -88,20 +88,65 @@ def completion_err(X: torch.tensor, Y: torch.tensor, A: torch.tensor) -> torch.t
     Outputs:
     - A torch tensor that contains a single element.
     '''
-    return torch.norm(X@Y.T - A)/A.norm()
+    return (torch.norm(X@Y.T - A)/A.norm()).item()
+
+def syntheticF(I: torch.tensor):
+    """
+    Samples the synthetic rank-2 matrix with jittered positions.
+    Inputs:
+    - I (torch.tensor): Exact, jittered index matrix.
+
+    Outputs:
+    - A torch.tensor containing the entries
+    """
+    return I[:,0] * I[:,1] + ((1 - I[:,0])**2)*((1 - I[:,1])**2)
+
+# Interpolation.
+
+def linterp1d(x:torch.tensor, points:torch.tensor):
+    '''
+    1-D piecewise linear interpolation for vectors.
+
+    Inputs:
+    - x (torch.tensor): every element of x must be in the interval [0, len(points) - 1].
+    - points (torch.tensor): 
+    '''
+        
+    # Calculate the coordinates of the nearest data points to x.
+    x1 = x.int()
+    x2 = x1 + 1
+
+    # Modify indexing for elements of x that correspond to the last data point.
+    max_ind = points.shape[0] - 1
+    x1[x1 >= max_ind] = max_ind - 1 
+    x2[x2 > max_ind] = max_ind
+    return ((x2 - x).reshape((-1,1))*torch.index_select(points,0,x1) + 
+            (x - x1).reshape((-1,1))*torch.index_select(points,0,x2))/h
+
+def linterp2d(X: torch.tensor, Y: torch.tensor, I:torch.tensor) -> torch.tensor:
+    '''
+    Bilinear interpolation on a low-rank matrix A = X(Y.T) with rank r.
+
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - I (torch.tensor): Index matrix of shape (m, 2).
+
+    Outputs:
+    - A torch.tensor of length m.
+    '''
+    xx: torch.tensor = linterp1d(I[:,0], X)
+    yy: torch.tensor = linterp1d(I[:,1], Y)
+    return torch.einsum('in, in -> i', xx, yy)
 
 # Loss Functions
 
 mse_loss = torch.nn.MSELoss()
 asd_loss = lambda X, Y: 0.5*((X - Y)**2).sum()
 
-def batch_loss( X: torch.tensor, 
-                Y: torch.tensor, 
-                A: torch.tensor, 
-                I: torch.tensor,
-                loss: function = mse_loss) -> torch.tensor:
+def mse_loss_std(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor) -> torch.tensor:
     '''
-    Evaluates the loss function over index set I.
+    Evaluates the MSE between A and X(Y.T) over the index set I.
     
     Inputs:
     - X (torch.tensor): Matrix of shape (n1, r).
@@ -113,17 +158,72 @@ def batch_loss( X: torch.tensor,
     Outputs:
     - A torch.tensor that contains a float. 
     '''
-    return loss(torch.einsum(
+    return mse_loss(torch.einsum(
         'in, in -> i',
         torch.index_select(X, 0, I[:,0]), 
         torch.index_select(Y, 0, I[:,1])
     ), A[I[:,0], I[:,1]])
 
+def asd_loss_std(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor) -> torch.tensor:
+    '''
+    Evaluates the ASD loss between A and X(Y.T) over the index set I.
+    
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - I (torch.tensor): Index matrix.
+    - loss (function): Loss function.
+
+    Outputs:
+    - A torch.tensor that contains a float. 
+    '''
+    return asd_loss(torch.einsum(
+        'in, in -> i',
+        torch.index_select(X, 0, I[:,0]), 
+        torch.index_select(Y, 0, I[:,1])
+    ), A[I[:,0], I[:,1]])
+
+def mse_loss_cont(X: torch.tensor, Y: torch.tensor, F: torch.tensor, I: torch.tensor) -> torch.tensor:
+    '''
+    Evaluates the MSE loss between A and X(Y.T) over the continuous index set I.
+    
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - F (torch.tensor): Sample of known entries.
+    - I (torch.tensor): Index matrix.
+    - loss (function): Loss function.
+
+    Outputs:
+    - A torch.tensor that contains a float. 
+    '''
+    return mse_loss(linterp2d(X,Y,I), F)
+
+def asd_loss_cont(X: torch.tensor, Y: torch.tensor, F: torch.tensor, I: torch.tensor) -> torch.tensor:
+    '''
+    Evaluates the ASD loss between A and X(Y.T) over the continuous index set I.
+    
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - F (torch.tensor): Sample of known entries.
+    - I (torch.tensor): Index matrix.
+    - loss (function): Loss function.
+
+    Outputs:
+    - A torch.tensor that contains a float. 
+    '''
+    return asd_loss(linterp2d(X,Y,I), F)
+
+def zero_fn(*args): return 0
+
 # Algorithms for standard matrix completion.
 
 def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
-             algo: str = "sgd", lr: float = 1, B: int = 1, dk: int = 100, K=10000, 
-             k_test=1, k_true=int(1e7), loss: function = mse_loss, q=0.99) -> dict:
+             algo: str = "sgd", lr: float = 1, loss: function = mse_loss_std, 
+             true_err_fn: function = zero_fn, B: int = 1, dk: int = 100, 
+             K=10000, k_test=1, k_true=int(1e7), q=0.99) -> dict:
     '''
     Optimise X and Y such that A = X(Y.T) using SGD or Adam.
     
@@ -132,8 +232,10 @@ def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
     - Y (torch.tensor): Matrix of shape (n2, r).
     - A (torch.tensor): Matrix of shape (n1, n2).
     - I (torch.tensor): Index matrix.
-    - algo (str): if not "adam", then SGD will be used.
+    - algo (str): If not "adam", then SGD will be used.
     - lr (float): Learning rate.
+    - loss (function): Function that takes X, Y, A, and I as arguments.
+    - true_err_fn (function): Function that takes X and Y as arguments.
     - B (int): Number of mini-batches.
     - dk (int): Iteration gap for comparing the test loss.
     - K (int): Maximum number of iterations.
@@ -176,13 +278,13 @@ def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
 
     for k in range(K):
         # Compute the training loss
-        train_loss = batch_loss(X, Y, A, I[((k % B) * batch_size):((k % B + 1) * batch_size)], loss)
+        train_loss = loss(X, Y, A, I[((k % B) * batch_size):((k % B + 1) * batch_size)])
         train_loss_list.append(train_loss.item())
         timestamps.append(time())
 
         # Compute the test loss.
         if (k % k_test == 0):
-            test_loss = batch_loss(X, Y, A, I[test_set_start:])
+            test_loss = loss(X, Y, A, I[test_set_start:])
             test_loss_list.append(test_loss.item())
             
             # Update the best parameters.
@@ -196,14 +298,14 @@ def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
 
         # Compute the mean completion error.
         if (k % k_true == 0):
-            true_err = completion_err(X, Y, A)
-            true_err_list.append(true_err.item())
+            true_err = true_err_fn(X, Y)
+            true_err_list.append(true_err)
         
         train_loss.backward()
         optimiser.step()
         optimiser.zero_grad()
 
-    print(f"Best mean completion error: {completion_err(best_params[0], best_params[1], A)}")
+    print(f"Best mean completion error: {true_err_fn(best_params[0], best_params[1])}")
 
     return {
         "train_loss_list": train_loss_list,
@@ -222,8 +324,9 @@ def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
     }
 
 def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
-        B: int = 1, db: int = 0, dk: int = 100, K=10000, k_test=1, k_true=int(1e7), 
-        q=0.99) -> dict:
+        train_loss_fn: function = asd_loss_std, test_loss_fn: function = mse_loss_std, 
+        true_err_fn: function = zero_fn, B: int = 1, db: int = 0, dk: int = 100, 
+        K=10000, k_test=1, k_true=int(1e7), q=0.99) -> dict:
     '''
     Optimise X and Y such that A = X(Y.T) using mini-batch ASD.
     
@@ -232,8 +335,11 @@ def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
     - Y (torch.tensor): Matrix of shape (n2, r).
     - A (torch.tensor): Matrix of shape (n1, n2).
     - I (torch.tensor): Index matrix.
+    - train_loss_fn (function): Function that takes X, Y, A, and I as arguments.
+    - test_loss_fn (function): Function that takes X, Y, A, and I as arguments.
+    - true_err_fn (function): Function that takes X and Y as arguments.
     - B (int): Number of mini-batches.
-    - db (int): mini-batch counter gap between X and Y.
+    - db (int): Mini-batch counter gap between X and Y.
     - dk (int): Iteration gap for comparing the test loss.
     - K (int): Maximum number of iterations.
     - k_test (int): Iteration gap for computing the test loss.
@@ -280,13 +386,13 @@ def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         j: int = (k % B + 1) * batch_size
 
         # Compute the training loss
-        train_loss = batch_loss(X, Y, A, I[i:j], asd_loss)
+        train_loss = train_loss_fn(X, Y, A, I[i:j])
         train_loss_list.append(train_loss.item())
         timestamps.append(time())
 
         # Compute the test loss.
         if (k % k_test == 0):
-            test_loss = batch_loss(X, Y, A, I[test_set_start:])
+            test_loss = test_loss_fn(X, Y, A, I[test_set_start:])
             test_loss_list.append(test_loss.item())
             
             # Update the best parameters.
@@ -300,8 +406,8 @@ def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
 
         # Compute the mean completion error.
         if (k % k_true == 0):
-            true_err = completion_err(X, Y, A)
-            true_err_list.append(true_err.item())
+            true_err = true_err_fn(X, Y)
+            true_err_list.append(true_err)
         
         train_loss.backward()
 
@@ -321,7 +427,7 @@ def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         # Compute the training loss.
         i: int = ((k + db) % B) * batch_size
         j: int = ((k + db) % B + 1) * batch_size
-        train_loss = batch_loss(X, Y, A, I[i:j], asd_loss)
+        train_loss = train_loss_fn(X, Y, A, I[i:j])
         train_loss.backward()
 
         # Adaptive learning rate for Y.
@@ -340,7 +446,7 @@ def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         lrX_list.append(lrX)
         lrY_list.append(lrY)
 
-    print(f"Best mean completion error: {completion_err(best_params[0], best_params[1], A)}")
+    print(f"Best mean completion error: {true_err_fn(best_params[0], best_params[1])}")
 
     return {
         "train_loss_list": train_loss_list,
@@ -373,7 +479,7 @@ def raw_asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
     - A (torch.tensor): Matrix of shape (n1, n2).
     - I (torch.tensor): Index matrix.
     - B (int): Number of mini-batches.
-    - db (int): mini-batch counter gap between X and Y.
+    - db (int): Mini-batch counter gap between X and Y.
     - dk (int): Iteration gap for comparing the test loss.
     - K (int): Maximum number of iterations.
     - k_test (int): Iteration gap for computing the test loss.
@@ -413,7 +519,7 @@ def raw_asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         
         # Compute the test loss.
         if (k % k_test == 0):
-            test_loss = batch_loss(X, Y, A, I[test_set_start:])
+            test_loss = mse_loss_std(X, Y, A, I[test_set_start:])
             test_loss_list.append(test_loss.item())
             
             # Update the best parameters.
@@ -460,178 +566,3 @@ def raw_asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         "lrX_list": lrX_list,
         "lrY_list": lrY_list
     }
-
-# Continuous matrix completion.
-
-def syntheticf(x):
-    """
-    Synthetic function yielding a rank-2 matrix
-    x must be a 2D tensor with shape (M,2)
-    """
-    return x[:,0]*x[:,1] + ((1-x[:,0])**2)*((1-x[:,1])**2)
-
-def optimise_f(optimiser, params, F, X,Y, B=1, dk=100, q=0.99, K=10000):
-    
-    U_ind, W_ind = X.T
-    batch_size = int((len(F)*0.9)//B)
-    test_set_start = batch_size*B
-
-    train_loss_list = []
-    test_loss_list = []
-    true_err_list = []
-    timestamps = []
-    best_U = None
-    best_W = None
-    best_test_loss = 1e6
-    best_iter = 0
-
-    for k in range(K):
-        timestamps.append(time())
-        i = (k % B)*batch_size
-        j = (k % B + 1)*batch_size
-        train_loss = new_loss(params[0], params[1], F[i:j], U_ind[i:j], W_ind[i:j])
-        test_loss = new_loss(params[0], params[1], F[test_set_start:], 
-                             U_ind[test_set_start:], W_ind[test_set_start:])
-        true_err = completion_err(params[0], params[1], Y)
-
-        train_loss_list.append(train_loss.item())
-        test_loss_list.append(test_loss.item())
-        true_err_list.append(true_err.item())
-        
-        # Save best parameters.
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_U = params[0].detach().clone()
-            best_W = params[1].detach().clone()
-            best_iter = k
-
-        # Early stopping.
-        if (k >= dk) and (train_loss > q * train_loss_list[k - dk]):
-            break
-        
-        train_loss.backward()
-        optimiser.step()
-        optimiser.zero_grad()
-
-    print(f"{k}, {best_iter}, {completion_err(best_U, best_W, Y)}")
-
-    return {
-        "final_params": params,
-        "train_loss_list": train_loss_list,
-        "test_loss_list": test_loss_list,
-        "true_err_list": true_err_list,
-        "timestamps": timestamps,
-        "best_params": [best_U, best_W],
-        "best_iter": best_iter
-    }
-
-def asd_f(U, W, F, Y, I, B=1, dk=100, q=0.99, K=1000, lr=4):
-
-    U_ind, W_ind = I.T
-    batch_size = int((len(F)*0.9)//B)
-    test_set_start = batch_size*B
-
-    train_loss_list = []
-    test_loss_list = []
-    true_err_list = []
-    timestamps = []
-    best_U = None
-    best_W = None
-    best_test_loss = 1e6
-    best_iter = 0
-
-    optimiserU = torch.optim.SGD([U], lr=lr)
-    optimiserW = torch.optim.SGD([W], lr=lr)
-
-    for k in range(K):
-        timestamps.append(time())
-        i = (k % B)*batch_size
-        j = (k % B + 1)*batch_size
-        
-        # Optimise U for fixed W.
-        train_loss = new_loss(
-            U, W, F[i:j], U_ind[i:j], W_ind[i:j], asd_loss
-        )
-        test_loss = new_loss(U, W, F[test_set_start:], 
-                               U_ind[test_set_start:], W_ind[test_set_start:])
-        true_err = completion_err(U, W, Y)
-
-        # train_loss_list.append(train_loss.item())
-        test_loss_list.append(test_loss.item())
-        true_err_list.append(true_err.item())
-
-        # Save best parameters.
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_U = U.detach().clone()
-            best_W = W.detach().clone()
-            best_iter = k
-
-        # Early stopping.
-        if (k >= dk) and (test_loss > q * test_loss_list[k - dk]):
-            break
-        
-        train_loss.backward()
-        lrU = (U.grad.detach().norm()/linterp2d(U.grad.detach(),W,U_ind[i:j],W_ind[i:j]).norm())**2
-        optimiserU.param_groups[0]["lr"] = lrU 
-        optimiserU.step()
-        optimiserU.zero_grad()
-        optimiserW.zero_grad()
-
-        # Optimise W for fixed U.
-        train_loss = new_loss(
-            U, W, F[i:j], U_ind[i:j], W_ind[i:j], asd_loss
-        )
-
-        train_loss.backward()
-        lrW = (W.grad.detach().norm()/linterp2d(U,W.grad.detach(),U_ind[i:j],W_ind[i:j]).norm())**2
-        optimiserW.param_groups[0]["lr"] = lrW
-        optimiserW.step()
-        optimiserW.zero_grad()
-        optimiserU.zero_grad()
-
-    print(f"{k}, {best_iter}, {completion_err(best_U, best_W, Y)}")
-
-    return {
-        "params": [U, W],
-        "train_loss_list": train_loss_list,
-        "test_loss_list": test_loss_list,
-        "true_err_list": true_err_list,
-        "timestamps": timestamps,
-        "best_params": [best_U, best_W],
-        "best_iter": best_iter
-    }
-
-# Interpolation.
-def linterp1d(x:torch.tensor, points:torch.tensor, h=1):
-    '''
-    1D piecewise linear interpolation using torch.
-
-    Inputs:
-    - x (torch.tensor): 1D tensor. Every element of x must be in the interval [0, len(points) - 1].
-    - h (int)         : Step size.
-    '''
-        
-    # Calculate the coordinates of the nearest data points to x.
-    x1 = (x // h).int()
-    x2 = x1 + h
-
-    # Modify indexing for elements of x that correspond to the last data point.
-    max_ind = points.shape[0] - 1
-    x1[x1 >= max_ind] = max_ind - 1 
-    x2[x2 > max_ind] = max_ind
-    return ((x2 - x).reshape((-1,1))*torch.index_select(points,0,x1) + 
-            (x - x1).reshape((-1,1))*torch.index_select(points,0,x2))/h
-
-def linterp2d(U: torch.tensor, W: torch.tensor, U_ind:torch.tensor, W_ind: torch.tensor, h=1):
-    uu = linterp1d(U_ind, U, h)
-    ww = linterp1d(W_ind, W, h)
-    return torch.einsum('in, in -> i', uu, ww)
-
-def new_loss( U: torch.tensor, 
-                W: torch.tensor, 
-                F: torch.tensor, 
-                U_ind,
-                W_ind,
-                loss=mse_loss):
-    return loss(linterp2d(U,W,U_ind,W_ind), F)
