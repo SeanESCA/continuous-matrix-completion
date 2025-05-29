@@ -221,11 +221,11 @@ def optimise(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         "lr": optimiser.param_groups[0]["lr"]
     }
 
-def asd1(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
-         B: int = 1, dk: int = 100, K=10000, 
-         k_test=1, k_true=int(1e7), q=0.99) -> dict:
+def asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
+        B: int = 1, db: int = 0, dk: int = 100, K=10000, k_test=1, k_true=int(1e7), 
+        q=0.99) -> dict:
     '''
-    Optimise X and Y such that A = X(Y.T) using mini-batch ASD 1.
+    Optimise X and Y such that A = X(Y.T) using mini-batch ASD.
     
     Inputs:
     - X (torch.tensor): Matrix of shape (n1, r).
@@ -233,6 +233,7 @@ def asd1(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
     - A (torch.tensor): Matrix of shape (n1, n2).
     - I (torch.tensor): Index matrix.
     - B (int): Number of mini-batches.
+    - db (int): mini-batch counter gap between X and Y.
     - dk (int): Iteration gap for comparing the test loss.
     - K (int): Maximum number of iterations.
     - k_test (int): Iteration gap for computing the test loss.
@@ -251,7 +252,6 @@ def asd1(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
     - k_test (int): Iteration gap for computing the test loss.
     - k_true (int): Iteration gap for computing the mean completion error.
     - q (float): Relative change in the test loss.
-    - lr (float): Learning rate.
     - lrX_list (list): Learning rates for optimising X in each iteration.
     - lrY_list (list): Learning rates for optimising Y in each iteration.
     '''
@@ -319,6 +319,8 @@ def asd1(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         optimiserY.zero_grad()
 
         # Compute the training loss.
+        i: int = ((k + db) % B) * batch_size
+        j: int = ((k + db) % B + 1) * batch_size
         train_loss = batch_loss(X, Y, A, I[i:j], asd_loss)
         train_loss.backward()
 
@@ -357,165 +359,110 @@ def asd1(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor,
         "lrY_list": lrY_list
     }
 
-def asd_2(U, W, Y, I, B=1, dk=100, q=0.99, K=1000, lr=4):
-
-    U_ind, W_ind = I.T
-    Y_ind = U_ind*Y.shape[1] + W_ind
-    batch_size = int((len(Y_ind)*0.9)//B)
-    test_set_start = batch_size*B
-
-    train_loss_list = []
-    test_loss_list = []
-    true_err_list = []
-    timestamps = []
-    best_U = None
-    best_W = None
-    best_test_loss = 1e6
-    best_iter = 0
+def raw_asd(X: torch.tensor, Y: torch.tensor, A: torch.tensor, I: torch.tensor, 
+        B: int = 1, db: int = 0, dk: int = 100, K=10000, k_test=1, 
+        k_true=int(1e7), q=0.99) -> dict:
+    '''
+    Optimise X and Y such that A = X(Y.T) using mini-batch ASD. This version
+    calculates the gradients and learning rates explicitly without any shortcuts, 
+    which makes it incredibly slow for large matrices.
     
-    lr_list_1 = []
-    lr_list_2 = []
+    Inputs:
+    - X (torch.tensor): Matrix of shape (n1, r).
+    - Y (torch.tensor): Matrix of shape (n2, r).
+    - A (torch.tensor): Matrix of shape (n1, n2).
+    - I (torch.tensor): Index matrix.
+    - B (int): Number of mini-batches.
+    - db (int): mini-batch counter gap between X and Y.
+    - dk (int): Iteration gap for comparing the test loss.
+    - K (int): Maximum number of iterations.
+    - k_test (int): Iteration gap for computing the test loss.
+    - k_true (int): Iteration gap for computing the mean completion error.
+    - q (float): Relative change in the test loss.
 
-    optimiserU = torch.optim.SGD([U], lr=lr)
-    optimiserW = torch.optim.SGD([W], lr=lr)
+    Outputs:
+    - test_loss_list (list): Test loss (float) for every (k_test)-th iteration.
+    - true_err_list (list): Mean completion error (float) for every (k_true)-th iteration.
+    - best_params (list): Factors [X, Y] with the lowest test loss.
+    - B (int): Number of mini-batches.
+    - dk (int): Iteration gap for comparing the test loss.
+    - K (int): Maximum number of iterations.
+    - k_test (int): Iteration gap for computing the test loss.
+    - k_true (int): Iteration gap for computing the mean completion error.
+    - q (float): Relative change in the test loss.
+    - lrX_list (list): Learning rates for optimising X in each iteration.
+    - lrY_list (list): Learning rates for optimising Y in each iteration.
+    '''
+    # Compute the size of each training mini-batch.
+    batch_size = int((I.size(0) * 0.9) // B)
 
-    for k in range(K):
-        timestamps.append(time())
-        i = (k % B)*batch_size
-        j = (k % B + 1)*batch_size
-        
-        # Optimise U for fixed W.
-        train_loss = batch_loss(
-            U, W, Y, U_ind[i:j], W_ind[i:j], Y_ind[i:j], asd_loss
-        )
-        test_loss = batch_loss(U, W, Y, 
-                               U_ind[test_set_start:], W_ind[test_set_start:], Y_ind[test_set_start:])
-        # true_err = completion_err(U, W, Y)
-
-        train_loss_list.append(train_loss.item())
-        test_loss_list.append(test_loss.item())
-        # true_err_list.append(true_err.item())
-
-        # Save best parameters.
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_U = U.detach().clone()
-            best_W = W.detach().clone()
-            best_iter = k
-
-        # Early stopping.
-        if (k >= dk) and (test_loss > q * test_loss_list[k - dk]):
-            break
-        
-        train_loss.backward()
-        lrU = (U.grad.detach().norm()/torch.einsum(
-            'in, in -> i',
-            torch.index_select(U.grad.detach(), 0, U_ind[i:j]), 
-            torch.index_select(W.detach(), 0, W_ind[i:j])
-        ).norm())**2
-        optimiserU.param_groups[0]["lr"] = lrU 
-        optimiserU.step()
-        optimiserU.zero_grad()
-        optimiserW.zero_grad()
-
-        # Optimise W for fixed U.
-        # i = ((k + 1) % B)*batch_size
-        # j = ((k + 1) % B + 1)*batch_size
-        i = ((k + B//2) % B)*batch_size
-        j = ((k + B//2) % B + 1)*batch_size
-        train_loss = batch_loss(
-            U, W, Y, U_ind[i:j], W_ind[i:j], Y_ind[i:j], asd_loss
-        )
-
-        train_loss.backward()
-        lrW = (W.grad.detach().norm()/torch.einsum(
-            'in, in -> i',
-            torch.index_select(U.detach(), 0, U_ind[i:j]), 
-            torch.index_select(W.grad.detach(), 0, W_ind[i:j])
-        ).norm())**2
-        optimiserW.param_groups[0]["lr"] = lrW
-        optimiserW.step()
-        optimiserW.zero_grad()
-        optimiserU.zero_grad()
-        lr_list_1.append((lrU, lrW))
-        lr_list_2.append((optimiserU.param_groups[0]["lr"], optimiserW.param_groups[0]["lr"]))
-
-    print(f"{k}, {best_iter}, {completion_err(best_U, best_W, Y)}")
-
-    return {
-        "params": [U, W],
-        "train_loss_list": train_loss_list,
-        "test_loss_list": test_loss_list,
-        "true_err_list": true_err_list,
-        "timestamps": timestamps,
-        "best_params": [best_U, best_W],
-        "best_iter": best_iter,
-        "lr_list_1": lr_list_1,
-        "lr_list_2": lr_list_2,
-    }
-
-def raw_asd(U, W, Y, I, B=1, dk=100, q=0.99, K=1000):
-
-    U_ind, W_ind = I.T
-    Y_ind = U_ind*Y.shape[1] + W_ind
-    batch_size = int((len(Y_ind)*0.9)//B)
-    test_set_start = batch_size*B
+    # Compute the starting index of the test set.
+    test_set_start: int = batch_size * B
 
     test_loss_list = []
     true_err_list = []
-    lr_list = []
-    best_U = None
-    best_W = None
+    best_params = []
+    lrX_list = []
+    lrY_list = []
     best_test_loss = 1e6
-    best_iter = 0
 
     for k in range(K):
-        i = (k % B)*batch_size
-        j = (k % B + 1)*batch_size
-        mask = make_mask(Y.shape[0],Y.shape[1],I[i:j])
+        i: int = (k % B) * batch_size
+        j: int = (k % B + 1) * batch_size
+        mask = make_mask(A, I[i:j])
         
-        # Optimise U for fixed W.
-        test_loss = batch_loss(U, W, Y, 
-                               U_ind[test_set_start:], W_ind[test_set_start:], Y_ind[test_set_start:])
-        true_err = completion_err(U, W, Y)
+        # Compute the test loss.
+        if (k % k_test == 0):
+            test_loss = batch_loss(X, Y, A, I[test_set_start:])
+            test_loss_list.append(test_loss.item())
+            
+            # Update the best parameters.
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss.item()
+                best_params = [X.detach().clone(), Y.detach().clone()]
 
-        test_loss_list.append(test_loss.item())
-        true_err_list.append(true_err.item())
+            # Early stopping condition.
+            if (k >= dk) and (test_loss > (q * test_loss_list[(k - dk)//k_test])):
+                break
 
-        # Save best parameters.
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_U = U.detach().clone()
-            best_W = W.detach().clone()
-            best_iter = k
-
-        # Early stopping.
-        if (k >= dk) and (test_loss > q * test_loss_list[k - dk]):
-            break
+        # Compute the mean completion error.
+        if (k % k_true == 0):
+            true_err = completion_err(X, Y, A)
+            true_err_list.append(true_err.item())
         
-        U_grad = - (Y*mask - (U.detach()@W.detach().T)*mask) @ W.detach()
-        lrU = (U_grad.norm()/((U_grad@W.T)*mask).norm())**2
-        U = U - lrU*U_grad
+        X_grad = - (Y * mask - (X @ Y.T) * mask) @ Y
+        lrX = (X_grad.norm() / ((X_grad @ Y.T) * mask).norm())**2
+        X = X - lrX * X_grad
 
         # Optimise W for fixed U.
-        
-        W_grad = - U.detach().T @ (Y*mask - (U.detach()@W.detach().T)*mask)
-        lrW = (W_grad.norm()/((U@W_grad)*mask).norm())**2
-        W = W - W_grad.T*lrW
-        lr_list.append((lrU, lrW))
+        i: int = ((k + db) % B) * batch_size
+        j: int = ((k + db) % B + 1) * batch_size
+        Y_grad = - X.T @ (Y * mask - (X @ Y.T) * mask)
+        lrY = (Y_grad.norm() / ((X @ Y_grad) * mask).norm())**2
+        Y = Y - Y_grad.T * lrY
 
-    print(f"{k}, {best_iter}, {completion_err(best_U, best_W, Y)}")
+        lrX_list.append(lrX)
+        lrY_list.append(lrY)
+
+    print(f"Best mean completion error: {completion_err(best_params[0], best_params[1], A)}")
 
     return {
-        "params": [U, W],
         "test_loss_list": test_loss_list,
         "true_err_list": true_err_list,
-        "best_params": [best_U, best_W],
-        "best_iter": best_iter,
-        "lr_list": lr_list
+        "best_params": best_params,
+        "final_params": [X, Y],
+        "k_test": k_test,
+        "k_true": k_true,
+        "B": B,
+        "dk": dk,
+        "K": K,
+        "q": q,
+        "lrX_list": lrX_list,
+        "lrY_list": lrY_list
     }
 
 # Continuous matrix completion.
+
 def syntheticf(x):
     """
     Synthetic function yielding a rank-2 matrix
